@@ -1,6 +1,9 @@
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  project:
+    name: "jackson-gross.esptiltblinds"
+    version: "1.0"
   on_boot:
     priority: -100
     then:
