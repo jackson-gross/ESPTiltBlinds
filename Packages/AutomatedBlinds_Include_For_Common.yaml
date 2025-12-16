@@ -1,0 +1,547 @@
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      # Restore last known position from flash
+      - stepper.report_position:
+          id: my_stepper
+          position: !lambda 'return id(saved_position);'
+      - cover.template.publish:
+          id: my_blind
+          position: !lambda 'return id(saved_position) / (float)id(max_position);'
+      - if:
+          condition:
+            lambda: 'return !id(is_calibrated);'
+          then:
+            - logger.log: "Tilt not calibrated. Use 'Start Calibration' button or service."
+            
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  services:
+    - service: control_tilt
+      variables:
+        target: int
+      then:
+        - stepper.set_target:
+            id: my_stepper
+            target: !lambda 'return target;'
+        - lambda: |-
+            id(saved_position) = target;
+    
+    # Service to start calibration
+    - service: start_calibration
+      then:
+        - logger.log: "Starting tilt calibration..."
+        - script.execute: calibrate_script
+    
+    # Service to set tilt to horizontal (middle position for max light)
+    - service: set_horizontal
+      then:
+        - stepper.set_target:
+            id: my_stepper
+            target: !lambda 'return id(max_position) / 2;'
+    
+    # Service to mark current position as one extreme
+    - service: set_tilt_extreme_1
+      then:
+        - stepper.report_position:
+            id: my_stepper
+            position: 0
+        - globals.set:
+            id: saved_position
+            value: '0'
+        - logger.log: "Current position set as EXTREME 1 (0 steps)"
+    
+    # Service to mark current position as opposite extreme
+    - service: set_tilt_extreme_2
+      then:
+        - globals.set:
+            id: max_position
+            value: !lambda 'return id(my_stepper).current_position;'
+        - globals.set:
+            id: is_calibrated
+            value: 'true'
+        - globals.set:
+            id: saved_position
+            value: !lambda 'return id(my_stepper).current_position;'
+        - logger.log:
+            format: "Current position set as EXTREME 2 (%d steps). Calibration complete!"
+            args: ['id(my_stepper).current_position']
+    
+    # Service to manually jog the tilt
+    - service: jog_tilt
+      variables:
+        steps: int
+      then:
+        - stepper.set_target:
+            id: my_stepper
+            target: !lambda 'return id(my_stepper).current_position + steps;'
+
+# Global variables to store calibration data
+globals:
+  - id: max_position
+    type: int
+    restore_value: yes
+    initial_value: '2048'  # Default for 180° tilt - typical range 1500-3000 steps
+  
+  - id: saved_position
+    type: int
+    restore_value: yes
+    initial_value: '1024'  # Start at middle (horizontal)
+  
+  - id: is_calibrated
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: calibration_step
+    type: int
+    initial_value: '0'  # 0=idle, 1=moving to extreme 1, 2=ready for extreme 2
+  
+  - id: tilt_speed
+    type: int
+    restore_value: yes
+    initial_value: '500'  # User adjustable speed
+  
+  - id: calibration_time
+    type: float
+    restore_value: yes
+    initial_value: '3.0'  # Seconds to run calibration in each direction
+
+cover:
+  - platform: template
+    name: "Blind Tilt"
+    id: my_blind
+    device_class: blind
+    has_position: true
+    optimistic: false
+    
+    # Lambda to return current position as percentage
+    lambda: |-
+      if (id(max_position) == 0) return 0.5;
+      return id(my_stepper).current_position / (float)id(max_position);
+    
+    position_action:
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda |-
+            int target = (int)(pos * id(max_position));
+            return target;
+      - delay: 100ms
+    
+    open_action:
+      - logger.log: "Opening tilt to extreme 2 (tilted opposite direction)"
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(max_position);'
+      - cover.template.publish:
+          id: my_blind
+          current_operation: OPENING
+    
+    close_action:
+      - logger.log: "Closing tilt to extreme 1 (tilted one direction)"
+      - stepper.set_target:
+          id: my_stepper
+          target: 0
+      - cover.template.publish:
+          id: my_blind
+          current_operation: CLOSING
+    
+    stop_action:
+      - logger.log: "Stopping tilt"
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(my_stepper).current_position;'
+      - cover.template.publish:
+          id: my_blind
+          current_operation: IDLE
+
+# Sensors for monitoring
+sensor:
+  - platform: template
+    name: "Tilt Position Steps"
+    id: position_steps
+    unit_of_measurement: "steps"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(my_stepper).current_position;
+  
+  - platform: template
+    name: "Tilt Position Percent"
+    id: position_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(max_position) == 0) return 0;
+      float percent = (id(my_stepper).current_position * 100.0) / id(max_position);
+      return percent;
+  
+  - platform: template
+    name: "Tilt Angle Estimate"
+    id: tilt_angle
+    unit_of_measurement: "°"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(max_position) == 0) return 0;
+      // Estimate: 0° = one extreme, 90° = horizontal, 180° = opposite extreme
+      float angle = (id(my_stepper).current_position * 180.0) / id(max_position);
+      return angle;
+  
+  - platform: template
+    name: "Distance from Horizontal"
+    id: distance_horizontal
+    unit_of_measurement: "°"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (id(max_position) == 0) return 0;
+      // Show how far from horizontal (90°) position
+      float angle = (id(my_stepper).current_position * 180.0) / id(max_position);
+      return abs(angle - 90.0);
+  
+  # WiFi signal strength
+  - platform: wifi_signal
+    name: "Blind WiFi Signal"
+    update_interval: 60s
+  
+  # Uptime sensor
+  - platform: uptime
+    name: "Blind Uptime"
+
+# Text sensor for calibration status and instructions
+text_sensor:
+  - platform: template
+    name: "Tilt Calibration Status"
+    id: calibration_status
+    update_interval: 2s
+    lambda: |-
+      if (id(calibration_step) == 1) {
+        return {"Calibrating: Moving to extreme position 1..."};
+      } else if (id(calibration_step) == 2) {
+        return {"Calibrating: Press 'Set Extreme 2' at opposite limit"};
+      } else if (id(is_calibrated)) {
+        char buf[70];
+        sprintf(buf, "Calibrated (0 to %d steps, 180° range)", id(max_position));
+        return {buf};
+      } else {
+        return {"Not Calibrated - Press 'Start Calibration'"};
+      }
+  
+  - platform: template
+    name: "Tilt Position Description"
+    id: position_description
+    update_interval: 2s
+    lambda: |-
+      if (id(max_position) == 0) return {"Unknown"};
+      float angle = (id(my_stepper).current_position * 180.0) / id(max_position);
+      
+      if (angle < 10) {
+        return {"Extreme 1 - Tilted fully one direction"};
+      } else if (angle > 170) {
+        return {"Extreme 2 - Tilted fully opposite direction"};
+      } else if (angle > 80 && angle < 100) {
+        return {"Horizontal - Maximum light (90°)"};
+      } else if (angle < 90) {
+        char buf[50];
+        sprintf(buf, "Tilted toward Extreme 1 (%.0f°)", angle);
+        return {buf};
+      } else {
+        char buf[50];
+        sprintf(buf, "Tilted toward Extreme 2 (%.0f°)", angle);
+        return {buf};
+      }
+
+# Calibration script - time-based calibration for tilt blinds
+script:
+  - id: calibrate_script
+    mode: restart
+    then:
+      - logger.log: "=== TILT CALIBRATION STARTED ==="
+      - logger.log:
+          format: "Using calibration time: %.1f seconds in each direction"
+          args: ['id(calibration_time)']
+      - globals.set:
+          id: calibration_step
+          value: '1'
+      
+      # Record the starting position
+      - lambda: |-
+          int start_pos = id(my_stepper).current_position;
+          ESP_LOGI("calibrate", "Start position: %d", start_pos);
+      
+      # Move in one direction for the configured time
+      - logger.log: "Step 1: Tilting to EXTREME 1..."
+      - stepper.set_target:
+          id: my_stepper
+          target: -5000  # Large negative number to ensure continuous movement
+      
+      # Run for the configured calibration time
+      - delay: !lambda 'return (int)(id(calibration_time) * 1000);'
+      
+      # Stop and record this as position 0
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(my_stepper).current_position;'
+      - delay: 500ms
+      
+      - stepper.report_position:
+          id: my_stepper
+          position: 0
+      - globals.set:
+          id: saved_position
+          value: '0'
+      
+      - logger.log: "EXTREME 1 set to position 0"
+      - logger.log: "Step 2: Tilting to EXTREME 2..."
+      - globals.set:
+          id: calibration_step
+          value: '2'
+      
+      # Move in opposite direction for the same configured time
+      - stepper.set_target:
+          id: my_stepper
+          target: 5000  # Large positive number to ensure continuous movement
+      
+      # Run for the same configured calibration time
+      - delay: !lambda 'return (int)(id(calibration_time) * 1000);'
+      
+      # Stop and record max position
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(my_stepper).current_position;'
+      - delay: 500ms
+      
+      # Save the max position
+      - globals.set:
+          id: max_position
+          value: !lambda 'return id(my_stepper).current_position;'
+      - globals.set:
+          id: is_calibrated
+          value: 'true'
+      - globals.set:
+          id: calibration_step
+          value: '0'
+      
+      - logger.log:
+          format: "=== CALIBRATION COMPLETE === Range: 0 to %d steps"
+          args: ['id(max_position)']
+      
+      # Move to horizontal (middle) position for maximum light
+      - logger.log: "Moving to horizontal position (50%%) for maximum light..."
+      - delay: 1s
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(max_position) / 2;'
+      
+      # Wait for movement to middle (should take ~half the calibration time)
+      - delay: !lambda 'return (int)((id(calibration_time) / 2.0 + 0.5) * 1000);'
+      
+      - globals.set:
+          id: saved_position
+          value: !lambda 'return id(my_stepper).current_position;'
+      - logger.log: "Calibration finished! Blinds at 50% (horizontal)"
+
+# Buttons for easy calibration and control
+button:
+  - platform: template
+    name: "Start Calibration"
+    id: start_calibration_button
+    on_press:
+      - script.execute: calibrate_script
+  
+  - platform: template
+    name: "Set Extreme 1"
+    id: set_extreme_1_button
+    on_press:
+      - stepper.report_position:
+          id: my_stepper
+          position: 0
+      - globals.set:
+          id: saved_position
+          value: '0'
+      - logger.log: "Current position marked as EXTREME 1"
+  
+  - platform: template
+    name: "Set Extreme 2"
+    id: set_extreme_2_button
+    on_press:
+      - globals.set:
+          id: max_position
+          value: !lambda 'return id(my_stepper).current_position;'
+      - globals.set:
+          id: is_calibrated
+          value: 'true'
+      - globals.set:
+          id: calibration_step
+          value: '0'
+      - logger.log:
+          format: "Current position marked as EXTREME 2 (%d steps). Calibrated!"
+          args: ['id(my_stepper).current_position']
+  
+  - platform: template
+    name: "Go Fully Down (0%)"
+    id: go_closed
+    on_press:
+      - stepper.set_target:
+          id: my_stepper
+          target: 0
+      - logger.log: "Moving to fully closed position (0%)"
+  
+  - platform: template
+    name: "Go to Horizontal (Max Light)"
+    id: go_horizontal
+    on_press:
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(max_position) / 2;'
+      - logger.log: "Moving to horizontal position (50%) for maximum light"
+  
+  - platform: template
+    name: "Go Fully Up (100%)"
+    id: go_open
+    on_press:
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(max_position);'
+      - logger.log: "Moving to fully open position (100%)"
+  
+  - platform: template
+    name: "Jog Open 150 Steps"
+    id: jog_forward
+    on_press:
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(my_stepper).current_position + 150;'
+  
+  - platform: template
+    name: "Jog Close 150 Steps"
+    id: jog_backward
+    on_press:
+      - stepper.set_target:
+          id: my_stepper
+          target: !lambda 'return id(my_stepper).current_position - 150;'
+  
+  - platform: restart
+    name: "Restart Blind Controller"
+
+# Number input for adjustable tilt speed (display only - requires recompile to change)
+number:
+  - platform: template
+    name: "Tilt Speed"
+    id: tilt_speed_config
+    min_value: 50
+    max_value: 1000
+    step: 10
+    initial_value: 500
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "steps/s"
+    mode: slider
+    on_value:
+      then:
+        - globals.set:
+            id: tilt_speed
+            value: !lambda 'return (int)x;'
+        - stepper.set_speed:
+            id: my_stepper
+            speed: !lambda 'return x;'
+        - logger.log:
+            format: "Tilt speed set to %d steps/s (takes effect after restart)"
+            args: ['(int)x']
+  
+  - platform: template
+    name: "Calibration Time"
+    id: calibration_time_config
+    min_value: 1.0
+    max_value: 10.0
+    step: 0.5
+    initial_value: 3.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    mode: slider
+    on_value:
+      then:
+        - globals.set:
+            id: calibration_time
+            value: !lambda 'return x;'
+        - logger.log:
+            format: "Calibration time set to %.1f seconds per direction"
+            args: ['x']
+
+# Status LED (uses built-in LED on GPIO2)
+switch:
+  - platform: gpio
+    pin: GPIO2
+    id: status_led
+    inverted: true
+    internal: true
+  
+  # Enable/disable movement LED indicator
+  - platform: template
+    name: "Enable Movement LED"
+    id: movement_led_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# Interval to blink LED when moving and save position periodically
+interval:
+  - interval: 300ms
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(movement_led_enabled).state;'
+              - lambda: 'return id(my_stepper).current_position != id(my_stepper).target_position;'
+          then:
+            - switch.toggle: status_led
+          else:
+            - switch.turn_off: status_led
+  
+  # Periodic position save during normal operation
+  - interval: 500ms
+    then:
+      - lambda: |-
+          static int last_saved = 0;
+          int current = id(my_stepper).current_position;
+          
+          // Save position every 50 steps to reduce flash wear
+          if (abs(current - last_saved) >= 50) {
+            id(saved_position) = current;
+            last_saved = current;
+          }
+          
+          // Always update cover position based on current stepper position
+          if (id(max_position) > 0) {
+            float pos = (float)current / (float)id(max_position);
+            id(my_blind).position = pos;
+            id(my_blind).publish_state();
+          }
+          
+          // Update operation state
+          if (current != id(my_stepper).target_position) {
+            if (current < id(my_stepper).target_position) {
+              id(my_blind).current_operation = COVER_OPERATION_OPENING;
+            } else {
+              id(my_blind).current_operation = COVER_OPERATION_CLOSING;
+            }
+          } else {
+            id(my_blind).current_operation = COVER_OPERATION_IDLE;
+          }
+          id(my_blind).publish_state();
+
+dashboard_import:
+  package_import_url: github://jackson-gross/ESPTiltBlinds/Packages/AutomatedBlinds_Include_For_Common.yaml@main
+  import_full_config: false
